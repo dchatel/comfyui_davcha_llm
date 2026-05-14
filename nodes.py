@@ -174,7 +174,7 @@ class DavchaPromptEnricher(io.ComfyNode):
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = '\n'.join([f'{x}:' for x in m])
 
-        p = f"""PROMPT:\n{prompt}\n\nKEYS:\n{keys}"""
+        p = f"""Based on the following prompt:\n\n---\n\n{prompt}\n\n---\n\nExpand each of the following keys:\n{keys}"""
         
         if images is not None:
             content = []

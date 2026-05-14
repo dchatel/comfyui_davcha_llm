@@ -103,9 +103,10 @@ class DavchaLLM(io.ComfyNode):
     def execute(cls, llm, system, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, response_format, images=None):
         if images is not None:
             content = []
-            
+            if not isinstance(images, list):
+                images = [images]
             for image in images:
-                array = (image*255).clamp(0, 255).byte().cpu().numpy()
+                array = (image[0]*255).clamp(0, 255).byte().cpu().numpy()
                 pil_img = Image.fromarray(array, mode="RGB")
                 buf = BytesIO()
                 pil_img.save(buf, format="PNG")
@@ -177,9 +178,10 @@ class DavchaPromptEnricher(io.ComfyNode):
         
         if images is not None:
             content = []
-            
+            if not isinstance(images, list):
+                images = [images]
             for image in images:
-                array = (image*255).clamp(0, 255).byte().cpu().numpy()
+                array = (image[0]*255).clamp(0, 255).byte().cpu().numpy()
                 pil_img = Image.fromarray(array, mode="RGB")
                 buf = BytesIO()
                 pil_img.save(buf, format="PNG")

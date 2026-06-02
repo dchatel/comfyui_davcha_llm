@@ -50,11 +50,24 @@ def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 7
         # 5. Safe Instantiation
         # Since classes like Gemma4ChatHandler use **kwargs, we just pass clip_model_path
         # and let Python's native MRO (Method Resolution Order) handle the routing.
+        kwargs = {}
+        
+        # Check if handler_cls supports 'enable_thinking'
         try:
-            return handler_cls(clip_model_path=clip_model_path)
+            sig = inspect.signature(handler_cls)
+            has_enable_thinking = "enable_thinking" in sig.parameters
+        except ValueError:
+            # Fallback if signature extraction fails
+            has_enable_thinking = False
+
+        if has_enable_thinking:
+            kwargs["enable_thinking"] = False
+
+        try:
+            return handler_cls(clip_model_path=clip_model_path, **kwargs)
         except TypeError as e:
             raise TypeError(
-                f"The matched handler '{handler_cls.__name__}' rejected the clip_model_path argument. "
+                f"The matched handler '{handler_cls.__name__}' rejected the arguments. "
                 f"Is this truly a multimodal model? Details: {e}"
             )
 

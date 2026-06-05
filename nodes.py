@@ -172,16 +172,16 @@ class DavchaPromptEnricher(io.ComfyNode):
             return io.NodeOutput(prompt)
         
         m = re.findall(r'\{([^}]+)\}', prompt)
-        keys = '\n'.join([f'"""{x.replace("\n", "\\n")}""": "",' for x in m])
+        keys = {x: "" for x in m}
 
         p = f"""PROMPT:
         {prompt}
         
         ---
         Fill the following dictionary:
-        {{
-            {keys}
-        }}"""
+        {keys}
+        """
+        messages = [{"role": "system", "content": system or ""}] if system else []
         
         if images is not None:
             content = []
@@ -197,15 +197,13 @@ class DavchaPromptEnricher(io.ComfyNode):
             
             content.append({'type': 'text', 'text': p})
 
-            messages = [
-                {"role": "system", "content": system},
+            messages.append(
                 {"role": "user", "content": content}
-            ]
+            )
         else:
-            messages = [
-                {"role": "system", "content": system},
+            messages.append(
                 {"role": "user", "content": p}
-            ]
+            )
 
         if force_json_output:
             response_format = {

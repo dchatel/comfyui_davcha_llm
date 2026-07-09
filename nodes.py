@@ -5,7 +5,7 @@ import base64
 from io import BytesIO
 from PIL import Image
 from glob import glob
-
+from rapidfuzz import fuzz, process
 from llama_cpp import Llama
 from comfy_api.latest import io
 import folder_paths
@@ -15,21 +15,44 @@ from .utils import *
 class DavchaLLMLoader(io.ComfyNode):
     gguf_folder = os.path.join(folder_paths.models_dir, "LLM", "GGUF")
     
+    # Cache pour les métadonnées (pour accélérer define_schema et F5)
+    _metadata_cache = {}
+        
     @classmethod
     def define_schema(cls):
         path = os.path.join(cls.gguf_folder, "**", "*.gguf")
         files = list(filter(lambda x: "mmproj" not in x, glob(path, recursive=True)))
         
+        # Nettoyage du cache si on a supprimé un fichier du dossier
+        cls._metadata_cache = {k: v for k, v in cls._metadata_cache.items() if k in files}
+        
         options = []
         for file in files:
-            llm = Llama(file, vocab_only=True, verbose=False)
-            arch = llm.metadata.get("general.architecture", "llama")
-            max_n_ctx = int(llm.metadata.get(f"{arch}.context_length"))
-            max_n_gpu_layers = int(llm.metadata.get(f"{arch}.block_count"))
+            # On vérifie la date de modification du fichier
+            mtime = os.path.getmtime(file)
+            
+            # On ne lit le GGUF que si c'est un nouveau fichier ou s'il a été modifié
+            if file not in cls._metadata_cache or cls._metadata_cache[file]['mtime'] != mtime:
+                try:
+                    llm_meta = Llama(file, vocab_only=True, verbose=False)
+                    arch = llm_meta.metadata.get("general.architecture", "llama")
+                    max_n_ctx = int(llm_meta.metadata.get(f"{arch}.context_length", 8192))
+                    max_n_gpu_layers = int(llm_meta.metadata.get(f"{arch}.block_count", 99))
+                    
+                    cls._metadata_cache[file] = {
+                        'mtime': mtime,
+                        'max_n_ctx': max_n_ctx,
+                        'max_n_gpu_layers': max_n_gpu_layers
+                    }
+                except Exception as e:
+                    print(f"[DavchaLLM] Erreur lecture métadonnées {file}: {e}")
+                    cls._metadata_cache[file] = {'mtime': mtime, 'max_n_ctx': 8192, 'max_n_gpu_layers': 99}
+            
+            cached_data = cls._metadata_cache[file]
             
             inputs = [
-                io.Int.Input("n_ctx", min=512, max=max_n_ctx, default=4096),
-                io.Int.Input("n_gpu_layers", min=-1, max=max_n_gpu_layers, default=-1),
+                io.Int.Input("n_ctx", min=512, max=cached_data['max_n_ctx'], default=4096),
+                io.Int.Input("n_gpu_layers", min=-1, max=cached_data['max_n_gpu_layers'], default=-1),
             ]
                 
             name = os.path.relpath(file, cls.gguf_folder)
@@ -150,7 +173,7 @@ class DavchaPromptEnricher(io.ComfyNode):
             category="davcha/llm",
             inputs=[
                 io.Custom("DavchaLLMModel").Input("llm"),
-                io.String.Input("system", multiline=True, dynamic_prompts=False),
+                io.String.Input("system", multiline=True, dynamic_prompts=False, default="You will be presented with a prompt, an image, and dictionary keys. Keys are placeholders to be expanded to modify the image.\n\nKeep the SAME KEYS.\nKeep the SAME DICTIONARY STRUCTURE.\nProcess ALL keys.\nNO empty values.\nFit the values nicely in the prompt.\nEnsure all values are coherent with each other.\n\nPair each key with a description expanding the concept given by the key.\nWrite a string,string pair json dictionary.\nOnly output json. No commentary."),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=False),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.Int.Input("max_tokens", min=1, default=512),
@@ -174,11 +197,11 @@ class DavchaPromptEnricher(io.ComfyNode):
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = {x: "" for x in m}
 
-        p = f"""PROMPT:
+        p = f"""Here is the PROMPT:
         {prompt}
-        
+
         ---
-        Fill the following dictionary:
+        Based on the prompt above (and the image if provided), generate detailed visual descriptions for the following variables:
         {keys}
         """
         messages = [{"role": "system", "content": system or ""}] if system else []
@@ -228,11 +251,22 @@ class DavchaPromptEnricher(io.ComfyNode):
             response_format=response_format,
         )
         groups = result['choices'][0]['message']['content']
+        print(f'------------------\nLLM Response\n------------------\n\n{groups}\n\n------------------')
         groups = strip_via_fuzzy_tags(groups, llm)
         
         import json_repair
         p = prompt
         for k, v in json_repair.loads(groups).items():
-            p = p.replace(f"{{{k}}}", "\n".join([str(x) for x in v]) if isinstance(v, list) else str(v))
+            # find correct key
+            best_match = process.extractOne(
+                query=k,
+                choices=list(keys.keys()),
+                scorer=fuzz.partial_ratio
+            )
+            if best_match:
+                matched_key, *_ = best_match
+                p = p.replace(f"{{{matched_key}}}", "\n".join([str(x) for x in v]) if isinstance(v, list) else str(v))
+            else:
+                print(f"unmatched key: {k}")
         
         return io.NodeOutput(p)

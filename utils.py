@@ -3,13 +3,14 @@ import re
 import inspect
 from rapidfuzz import process, fuzz
 from llama_cpp import llama_chat_format
+from gguf import GGUFReader
 
 def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 70.0):
         """
         Dynamically extracts multimodal chat handlers and uses RapidFuzz to map 
         the model filename to the handler, respecting **kwargs and inheritance.
         """
-        # 1. Extract valid chat handlers based purely on naming convention
+        # Extract valid chat handlers based purely on naming convention
         handlers = {}
         for name, cls in inspect.getmembers(llama_chat_format, inspect.isclass):
             if name.endswith("ChatHandler"):
@@ -20,34 +21,48 @@ def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 7
         if not handlers:
             raise RuntimeError("No chat handlers found in llama_cpp.llama_chat_format.")
 
-        # 2. Normalize the model filename for fuzzy matching
-        # E.g., "gemma-4-8b-multimodal-q4_k.gguf" -> "gemma48bmultimodalq4kgguf"
         filename = os.path.basename(model_path).lower()
-        normalized_filename = re.sub(r'[^a-z0-9]', '', filename)
+        
+        best_match = None
+        
+        # Try matching against projector type first
+        gguf = GGUFReader(clip_model_path)
+        projector_type = gguf.get_field('clip.projector_type')
+        if projector_type is not None:
+            projector_type = projector_type.contents()
+            best_match = process.extractOne(
+                query=projector_type,
+                choices=list(handlers.keys()),
+                scorer=fuzz.partial_ratio
+            )
+        
+        if not best_match or best_match[1] < threshold:
+            # Try matching against the filename
+            # Normalize the model filename for fuzzy matching
+            # E.g., "gemma-4-8b-multimodal-q4_k.gguf" -> "gemma48bmultimodalq4kgguf"
+            normalized_filename = re.sub(r'[^a-z0-9]', '', filename)
 
-        # 3. Fuzzy match using RapidFuzz
-        best_match = process.extractOne(
-            query=normalized_filename,
-            choices=list(handlers.keys()),
-            scorer=fuzz.partial_ratio
-        )
+            # Fuzzy match using RapidFuzz
+            best_match = process.extractOne(
+                query=normalized_filename,
+                choices=list(handlers.keys()),
+                scorer=fuzz.partial_ratio
+            )
 
         if not best_match:
             raise ValueError("Could not find any suitable chat handlers.")
 
         matched_key, score, _ = best_match
 
-        # 4. Enforce confidence threshold
+        # Enforce confidence threshold
         if score < threshold:
-            raise ValueError(
-                f"No chat handler matched with confidence >= {threshold}. "
-                f"Best guess was '{matched_key}' (Score: {score:.1f})."
-            )
-
-        handler_cls = handlers[matched_key]
-        print(f"[Auto-Detect] Filename '{filename}' mapped to '{handler_cls.__name__}' (Fuzzy Score: {score:.1f}%)")
+            # Fallback on default Llava
+            handler_cls = llama_chat_format.Llava15ChatHandler
+        else:
+            handler_cls = handlers[matched_key]
+            print(f"[Auto-Detect] Filename '{filename}' mapped to '{handler_cls.__name__}' (Fuzzy Score: {score:.1f}%)")
         
-        # 5. Safe Instantiation
+        # Safe Instantiation
         # Since classes like Gemma4ChatHandler use **kwargs, we just pass clip_model_path
         # and let Python's native MRO (Method Resolution Order) handle the routing.
         kwargs = {}

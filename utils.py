@@ -5,7 +5,7 @@ from rapidfuzz import process, fuzz
 from llama_cpp import llama_chat_format
 from gguf import GGUFReader
 
-def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 70.0):
+def get_chat_handler(model_path: str, mmproj_path: str, threshold: float = 70.0):
         """
         Dynamically extracts multimodal chat handlers and uses RapidFuzz to map 
         the model filename to the handler, respecting **kwargs and inheritance.
@@ -26,7 +26,7 @@ def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 7
         best_match = None
         
         # Try matching against projector type first
-        gguf = GGUFReader(clip_model_path)
+        gguf = GGUFReader(mmproj_path)
         projector_type = gguf.get_field('clip.projector_type')
         if projector_type is not None:
             projector_type = projector_type.contents()
@@ -63,7 +63,7 @@ def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 7
             print(f"[Auto-Detect] Filename '{filename}' mapped to '{handler_cls.__name__}' (Fuzzy Score: {score:.1f}%)")
         
         # Safe Instantiation
-        # Since classes like Gemma4ChatHandler use **kwargs, we just pass clip_model_path
+        # Since classes like Gemma4ChatHandler use **kwargs, we just pass mmproj_path
         # and let Python's native MRO (Method Resolution Order) handle the routing.
         kwargs = {}
         
@@ -79,7 +79,7 @@ def get_chat_handler(model_path: str, clip_model_path: str, threshold: float = 7
             kwargs["enable_thinking"] = False
 
         try:
-            return handler_cls(clip_model_path=clip_model_path, **kwargs)
+            return handler_cls(mmproj_path=mmproj_path, **kwargs)
         except TypeError as e:
             raise TypeError(
                 f"The matched handler '{handler_cls.__name__}' rejected the arguments. "

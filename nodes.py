@@ -8,6 +8,7 @@ from glob import glob
 from rapidfuzz import fuzz, process
 from llama_cpp import Llama
 from comfy_api.latest import io
+from pathlib import Path
 import folder_paths
 
 from .utils import *
@@ -55,7 +56,7 @@ class DavchaLLMLoader(io.ComfyNode):
                 io.Int.Input("n_gpu_layers", min=-1, max=cached_data['max_n_gpu_layers'], default=-1),
             ]
                 
-            name = os.path.relpath(file, cls.gguf_folder)
+            name = Path(os.path.relpath(file, cls.gguf_folder)).parent.name
             option = io.DynamicCombo.Option(name, inputs)
             options.append(option)
         
@@ -79,9 +80,16 @@ class DavchaLLMLoader(io.ComfyNode):
         model = model.get("model", None)
         if model is None:
             raise FileExistsError("model")
-        model = os.path.join(cls.gguf_folder, model)
         
-        mmproj = next(iter(glob(os.path.join(os.path.dirname(model), "*mmproj*"))), None)
+        models = sorted(glob(os.path.join(cls.gguf_folder, model, "*.gguf")), key=lambda x: "mmproj" in x)
+        if len(models) == 1:
+            model = models[0]
+            mmproj = None
+        elif len(models) == 2:
+            model, mmproj = models
+        else:
+            raise FileExistsError(f"Multiple GGUF files found for model '{model}' in {cls.gguf_folder}. Expected 1 or 2 (with mmproj), found {len(models)}.")
+        
         if mmproj:
             mmproj = get_chat_handler(model, mmproj)
 
@@ -197,13 +205,7 @@ class DavchaPromptEnricher(io.ComfyNode):
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = {x: "" for x in m}
 
-        p = f"""Here is the PROMPT:
-        {prompt}
-
-        ---
-        Based on the prompt above (and the image if provided), generate detailed visual descriptions for the following variables:
-        {keys}
-        """
+        p = f"""Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables. Minimum length: 1 sentence. Result in the same format:\n{keys}"""
         messages = [{"role": "system", "content": system or ""}] if system else []
         
         if images is not None:
@@ -256,7 +258,14 @@ class DavchaPromptEnricher(io.ComfyNode):
         
         import json_repair
         p = prompt
-        for k, v in json_repair.loads(groups).items():
+        j = json_repair.loads(groups)
+        d = {}
+        if isinstance(j, list):
+            for item in j:
+                d.update(item)
+        else:
+            d = j
+        for k, v in d.items():
             # find correct key
             best_match = process.extractOne(
                 query=k,

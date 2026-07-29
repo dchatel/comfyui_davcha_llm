@@ -6,12 +6,20 @@ from io import BytesIO
 from PIL import Image
 from glob import glob
 from rapidfuzz import fuzz, process
+import llama_cpp
 from llama_cpp import Llama
 from comfy_api.latest import io
 from pathlib import Path
 import folder_paths
 
 from .utils import *
+
+# Standard GGML enum integer values: 1 = F16, 8 = Q8_0, 2 = Q4_0
+KV_CACHE_TYPES = {
+    "f16": getattr(getattr(llama_cpp, "llama_cpp", llama_cpp), "GGML_TYPE_F16", 1),
+    "q8_0": getattr(getattr(llama_cpp, "llama_cpp", llama_cpp), "GGML_TYPE_Q8_0", 8),
+    "q4_0": getattr(getattr(llama_cpp, "llama_cpp", llama_cpp), "GGML_TYPE_Q4_0", 2),
+}
 
 class DavchaLLMLoader(io.ComfyNode):
     gguf_folder = os.path.join(folder_paths.models_dir, "LLM", "GGUF")
@@ -40,21 +48,32 @@ class DavchaLLMLoader(io.ComfyNode):
                     max_n_ctx = int(llm_meta.metadata.get(f"{arch}.context_length", 8192))
                     max_n_gpu_layers = int(llm_meta.metadata.get(f"{arch}.block_count", 99))
                     
+                    # Détection si c'est un modèle MoE (ex: DeepSeek, Mixtral, Qwen MoE, etc.)
+                    expert_count = int(llm_meta.metadata.get(f"{arch}.expert_count", 0))
+                    expert_used_count = int(llm_meta.metadata.get(f"{arch}.expert_used_count", 0))
+                    is_moe = expert_count > 0 or expert_used_count > 0 or any(kw in arch.lower() for kw in ["moe", "mixtral", "dbrx"])
+                    
                     cls._metadata_cache[file] = {
                         'mtime': mtime,
                         'max_n_ctx': max_n_ctx,
-                        'max_n_gpu_layers': max_n_gpu_layers
+                        'max_n_gpu_layers': max_n_gpu_layers,
+                        'is_moe': is_moe
                     }
                 except Exception as e:
                     print(f"[DavchaLLM] Erreur lecture métadonnées {file}: {e}")
-                    cls._metadata_cache[file] = {'mtime': mtime, 'max_n_ctx': 8192, 'max_n_gpu_layers': 99}
+                    cls._metadata_cache[file] = {'mtime': mtime, 'max_n_ctx': 8192, 'max_n_gpu_layers': 99, 'is_moe': False}
             
             cached_data = cls._metadata_cache[file]
             
+            # Sub-inputs per selected model
             inputs = [
                 io.Int.Input("n_ctx", min=512, max=cached_data['max_n_ctx'], default=4096),
                 io.Int.Input("n_gpu_layers", min=-1, max=cached_data['max_n_gpu_layers'], default=-1),
             ]
+            
+            # Dynamically add n_cpu_moe ONLY for MoE models
+            if cached_data['is_moe']:
+                inputs.append(io.Int.Input("n_cpu_moe", min=0, max=cached_data['max_n_gpu_layers'], default=0))
                 
             name = Path(os.path.relpath(file, cls.gguf_folder)).parent.name
             option = io.DynamicCombo.Option(name, inputs)
@@ -66,6 +85,9 @@ class DavchaLLMLoader(io.ComfyNode):
             inputs=[
                 io.DynamicCombo.Input("model", options=options),
                 io.Int.Input("n_batch", min=64, max=32768, default=512),
+                io.Int.Input("n_ubatch", min=64, max=4096, default=512),
+                io.Combo.Input("kv_cache_type", options=["f16", "q8_0", "q4_0"], default="q8_0"),
+                io.Boolean.Input("flash_attn", default=True),
                 io.Int.Input("pool_size", min=1048576, max=10485760, default=4194304, step=524288),
             ],
             outputs=[
@@ -74,32 +96,43 @@ class DavchaLLMLoader(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, model, n_batch, pool_size):
+    def execute(cls, model, n_batch, n_ubatch, kv_cache_type, flash_attn, pool_size):
         n_ctx = model.get("n_ctx", 4096)
         n_gpu_layers = model.get("n_gpu_layers", -1)
-        model = model.get("model", None)
-        if model is None:
+        # Defaults to 0 safely for non-MoE models where "n_cpu_moe" is not present
+        n_cpu_moe = model.get("n_cpu_moe", 0)
+        model_name = model.get("model", None)
+        if model_name is None:
             raise FileExistsError("model")
         
-        models = sorted(glob(os.path.join(cls.gguf_folder, model, "*.gguf")), key=lambda x: "mmproj" in x)
+        models = sorted(glob(os.path.join(cls.gguf_folder, model_name, "*.gguf")), key=lambda x: "mmproj" in x)
         if len(models) == 1:
-            model = models[0]
+            model_file = models[0]
             mmproj = None
         elif len(models) == 2:
-            model, mmproj = models
+            model_file, mmproj = models
         else:
-            raise FileExistsError(f"Multiple GGUF files found for model '{model}' in {cls.gguf_folder}. Expected 1 or 2 (with mmproj), found {len(models)}.")
+            raise FileExistsError(f"Multiple GGUF files found for model '{model_name}' in {cls.gguf_folder}. Expected 1 or 2 (with mmproj), found {len(models)}.")
         
         if mmproj:
-            mmproj = get_chat_handler(model, mmproj)
+            mmproj = get_chat_handler(model_file, mmproj)
+
+        kv_type = KV_CACHE_TYPES.get(kv_cache_type, KV_CACHE_TYPES["q8_0"])
 
         llm = Llama(
-            model_path=model,
+            model_path=model_file,
             chat_handler=mmproj,
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
+            n_cpu_moe=n_cpu_moe,
+            type_k=kv_type,
+            type_v=kv_type,
+            flash_attn=flash_attn,
             swa_full=True,
             n_batch=n_batch,
+            n_ubatch=n_ubatch,
+            offload_kqv=True,
+            logits_all=False,
             pool_size=pool_size,
             verbose=False
         )

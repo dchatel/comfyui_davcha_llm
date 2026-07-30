@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import re
 import json
@@ -26,6 +27,7 @@ class DavchaLLMLoader(io.ComfyNode):
     
     # Cache pour les métadonnées (pour accélérer define_schema et F5)
     _metadata_cache = {}
+    _path_map = {}
         
     @classmethod
     def define_schema(cls):
@@ -36,6 +38,8 @@ class DavchaLLMLoader(io.ComfyNode):
         cls._metadata_cache = {k: v for k, v in cls._metadata_cache.items() if k in files}
         
         options = []
+        cls._path_map.clear()
+        
         for file in files:
             # On vérifie la date de modification du fichier
             mtime = os.path.getmtime(file)
@@ -57,11 +61,13 @@ class DavchaLLMLoader(io.ComfyNode):
                         'mtime': mtime,
                         'max_n_ctx': max_n_ctx,
                         'max_n_gpu_layers': max_n_gpu_layers,
-                        'is_moe': is_moe
+                        'is_moe': is_moe,
+                        'expert_count': expert_count,
+                        'expert_used_count': expert_used_count,
                     }
                 except Exception as e:
                     print(f"[DavchaLLM] Erreur lecture métadonnées {file}: {e}")
-                    cls._metadata_cache[file] = {'mtime': mtime, 'max_n_ctx': 8192, 'max_n_gpu_layers': 99, 'is_moe': False}
+                    cls._metadata_cache[file] = {'mtime': mtime, 'max_n_ctx': 8192, 'max_n_gpu_layers': 99, 'is_moe': False, 'expert_count': 0, 'expert_used_count': 0}
             
             cached_data = cls._metadata_cache[file]
             
@@ -74,21 +80,26 @@ class DavchaLLMLoader(io.ComfyNode):
             # Dynamically add n_cpu_moe ONLY for MoE models
             if cached_data['is_moe']:
                 inputs.append(io.Int.Input("n_cpu_moe", min=0, max=cached_data['max_n_gpu_layers'], default=0))
+                inputs.append(io.Int.Input("expert_used_count", min=1, max=cached_data['expert_count'], default=cached_data['expert_used_count']))
                 
-            name = Path(os.path.relpath(file, cls.gguf_folder)).parent.name
+            # name = Path(os.path.relpath(file, cls.gguf_folder)).parent.name
+            name = Path(file).stem
+            cls._path_map[name] = file
             option = io.DynamicCombo.Option(name, inputs)
             options.append(option)
+        
+        default_threads = max(1, multiprocessing.cpu_count() // 2)
         
         return io.Schema(
             node_id="DavchaLLMLoader",
             category="davcha/llm",
             inputs=[
                 io.DynamicCombo.Input("model", options=options),
-                io.Int.Input("n_batch", min=64, max=32768, default=512),
+                io.Int.Input("n_batch", min=64, max=32768, default=2048),
                 io.Int.Input("n_ubatch", min=64, max=4096, default=512),
+                io.Int.Input("n_threads", min=1, max=128, default=default_threads),
                 io.Combo.Input("kv_cache_type", options=["f16", "q8_0", "q4_0"], default="q8_0"),
                 io.Boolean.Input("flash_attn", default=True),
-                io.Int.Input("pool_size", min=1048576, max=10485760, default=4194304, step=524288),
             ],
             outputs=[
                 io.Custom("DavchaLLMModel").Output(),
@@ -96,28 +107,45 @@ class DavchaLLMLoader(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, model, n_batch, n_ubatch, kv_cache_type, flash_attn, pool_size):
+    def execute(cls, model, n_batch, n_ubatch, n_threads, kv_cache_type, flash_attn):
         n_ctx = model.get("n_ctx", 4096)
         n_gpu_layers = model.get("n_gpu_layers", -1)
         # Defaults to 0 safely for non-MoE models where "n_cpu_moe" is not present
         n_cpu_moe = model.get("n_cpu_moe", 0)
+        expert_used_count = model.get("expert_used_count", None)
+        
         model_name = model.get("model", None)
         if model_name is None:
             raise FileExistsError("model")
         
-        models = sorted(glob(os.path.join(cls.gguf_folder, model_name, "*.gguf")), key=lambda x: "mmproj" in x)
-        if len(models) == 1:
-            model_file = models[0]
-            mmproj = None
-        elif len(models) == 2:
-            model_file, mmproj = models
-        else:
-            raise FileExistsError(f"Multiple GGUF files found for model '{model_name}' in {cls.gguf_folder}. Expected 1 or 2 (with mmproj), found {len(models)}.")
+        model_file = cls._path_map[model_name]
+        mmproj_files = glob(os.path.join(os.path.dirname(model_file), "*mmproj*.gguf"))
+        mmproj = mmproj_files[0] if mmproj_files else None
+        # models = sorted(glob(os.path.join(cls.gguf_folder, model_name, "*.gguf")), key=lambda x: "mmproj" in x)
+        # if len(models) == 1:
+        #     model_file = models[0]
+        #     mmproj = None
+        # elif len(models) == 2:
+        #     model_file, mmproj = models
+        # else:
+        #     raise FileExistsError(f"Multiple GGUF files found for model '{model_name}' in {cls.gguf_folder}. Expected 1 or 2 (with mmproj), found {len(models)}.")
         
         if mmproj:
             mmproj = get_chat_handler(model_file, mmproj)
 
         kv_type = KV_CACHE_TYPES.get(kv_cache_type, KV_CACHE_TYPES["q8_0"])
+        
+        try:
+            meta_llm = Llama(model_path=model_file, vocab_only=True, verbose=False)
+            arch = meta_llm.metadata.get("general.architecture", "llama")
+        except:
+            arch = "llama"
+            
+        kv_overrides = {}
+        if expert_used_count is not None:
+            override_key = f"{arch}.expert_used_count"
+            kv_overrides[override_key] = int(expert_used_count)
+            print(f"[DavchaLLM] Overriding MoE Top-K: {override_key} = {expert_used_count}")
 
         llm = Llama(
             model_path=model_file,
@@ -125,15 +153,17 @@ class DavchaLLMLoader(io.ComfyNode):
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             n_cpu_moe=n_cpu_moe,
+            kv_overrides=kv_overrides,
             type_k=kv_type,
             type_v=kv_type,
             flash_attn=flash_attn,
             swa_full=True,
             n_batch=n_batch,
             n_ubatch=n_ubatch,
+            n_threads=n_threads,
+            n_threads_batch=n_threads,
             offload_kqv=True,
             logits_all=False,
-            pool_size=pool_size,
             verbose=False
         )
         
@@ -155,6 +185,7 @@ class DavchaLLM(io.ComfyNode):
                 io.Float.Input("top_p", min=0.0, max=1.0, default=0.95),
                 io.Int.Input("top_k", min=0, max=100, default=40),
                 io.Float.Input("repeat_penalty", min=0.5, max=2.0, default=1.2),
+                io.Boolean.Input("enable_thinking", default=True),
                 io.String.Input("response_format", multiline=True, dynamic_prompts=False, default=""),
                 io.Image.Input("images", optional=True),
             ],
@@ -164,7 +195,7 @@ class DavchaLLM(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, llm, system, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, response_format, images=None):
+    def execute(cls, llm, system, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, enable_thinking, response_format, images=None):
         if images is not None:
             content = []
             if not isinstance(images, list):
@@ -191,16 +222,17 @@ class DavchaLLM(io.ComfyNode):
             
         response_format = json.loads(response_format) if response_format.strip() != "" else None
         
-        result = llm.create_chat_completion(
-            seed=seed,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repeat_penalty=repeat_penalty,
-            response_format=response_format,
-        )
+        with disable_thinking_context(llm, enable_thinking):
+            result = llm.create_chat_completion(
+                seed=seed,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                response_format=response_format,
+            )
         
         result = strip_via_fuzzy_tags(result['choices'][0]['message']['content'], llm)
         
@@ -222,6 +254,7 @@ class DavchaPromptEnricher(io.ComfyNode):
                 io.Float.Input("top_p", min=0.0, max=1.0, default=0.95, step=0.01),
                 io.Int.Input("top_k", min=0, max=100, default=40),
                 io.Float.Input("repeat_penalty", min=0.5, max=2.0, default=1.2, step=0.01),
+                io.Boolean.Input("enable_thinking", default=True),
                 io.Boolean.Input("force_json_output", default=True),
                 io.Image.Input("images", optional=True),
             ],
@@ -231,14 +264,14 @@ class DavchaPromptEnricher(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, llm, system, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, force_json_output, images=None):
+    def execute(cls, llm, system, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, enable_thinking, force_json_output, images=None):
         if not re.search(r'\{([^}]+)\}', prompt):
             return io.NodeOutput(prompt)
         
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = {x: "" for x in m}
 
-        p = f"""Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables. Minimum length: 1 sentence. Result in the same format:\n{keys}"""
+        p = f"""Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables. Minimum length > 0. Result in the same format:\n{keys}"""
         messages = [{"role": "system", "content": system or ""}] if system else []
         
         if images is not None:
@@ -275,16 +308,17 @@ class DavchaPromptEnricher(io.ComfyNode):
         else:
             response_format = None
         
-        result = llm.create_chat_completion(
-            seed=seed,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repeat_penalty=repeat_penalty,
-            response_format=response_format,
-        )
+        with disable_thinking_context(llm, enable_thinking):
+            result = llm.create_chat_completion(
+                seed=seed,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                response_format=response_format,
+            )
         groups = result['choices'][0]['message']['content']
         print(f'------------------\nLLM Response\n------------------\n\n{groups}\n\n------------------')
         groups = strip_via_fuzzy_tags(groups, llm)

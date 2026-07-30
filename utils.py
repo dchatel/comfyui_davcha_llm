@@ -1,6 +1,7 @@
 import os
 import re
 import inspect
+import contextlib
 from rapidfuzz import process, fuzz
 from llama_cpp import llama_chat_format
 from gguf import GGUFReader
@@ -135,3 +136,93 @@ def strip_via_fuzzy_tags(text: str, llm, threshold: float = 85.0) -> str:
         return text[first_match.end():].strip()
 
     return text
+
+@contextlib.contextmanager
+def disable_thinking_context(llm, enable_thinking):
+    """
+    Dynamically intercepts prompt generation to bypass reasoning blocks safely.
+    Works across Jinja templates and hardcoded Multimodal Python handlers without breaking the token ledger.
+    """
+    if enable_thinking:
+        yield
+        return
+        
+    handler = getattr(llm, "chat_handler", None)
+    if not handler:
+        yield
+        return
+        
+    # 1. Patch Jinja-based handlers (Text models)
+    handler_template = getattr(handler, "template", None)
+    if handler_template and isinstance(handler_template, str):
+        handler.template = "{% set enable_thinking = false %}\n" + handler_template
+
+    # 2. Extract the bypass block for Multimodal handlers
+    template = llm.metadata.get("tokenizer.chat_template", "")
+    
+    # Regex hunts for exactly what the model creator defined: 
+    # e.g., {%- if not enable_thinking... -%}{{- '<|channel>thought\n<channel|>' -}}
+    match = re.search(r'if not enable_thinking.*?\{\{-?\s*[\'"]([^\'"]+)[\'"]\s*-?\}\}', template, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        empty_block = match.group(1).replace('\\n', '\n')
+        print(f"[DavchaLLM] Extracted thought bypass block: {repr(empty_block)}")
+    else:
+        # Robust inference fallback if the regex fails to find the toggle
+        if "<channel|>" in template or "<channel>" in template or "Gemma" in type(handler).__name__:
+            # specific fix for Gemma 4 / HauhauCS
+            empty_block = "<|channel|>thought\n<channel|>"
+        elif "</thought>" in template:
+            empty_block = "<thought>\n</thought>\n"
+        else:
+            empty_block = "<think>\n</think>\n"
+        print(f"[DavchaLLM] Inferred thought bypass block: {repr(empty_block)}")
+
+    # 3. Patch Multimodal handlers (Vision models) BEFORE the ledger is created!
+    original_m2p = getattr(handler, "messages_to_prompt", None)
+    
+    if original_m2p:
+        def patched_m2p(*args, **kwargs):
+            # Call original to format the user's prompt and extract images
+            result = original_m2p(*args, **kwargs)
+            
+            # Tokenize our dynamically found bypass block
+            think_tokens = llm.tokenize(empty_block.encode('utf-8'), special=True)
+            bos_id = llm.token_bos()
+            if bos_id != -1 and len(think_tokens) > 0 and think_tokens[0] == bos_id:
+                think_tokens = think_tokens[1:]
+                
+            # Safely inject the tokens/string at the end of the prompt sequence
+            # The handler will now build its ledger based on this modified sequence natively!
+            if isinstance(result, tuple):
+                prompt = result[0]
+                if isinstance(prompt, list):
+                    prompt = list(prompt) + list(think_tokens)
+                elif isinstance(prompt, str):
+                    prompt = prompt + empty_block
+                return (prompt, *result[1:])
+            else:
+                prompt = result
+                if isinstance(prompt, list):
+                    prompt = list(prompt) + list(think_tokens)
+                elif isinstance(prompt, str):
+                    prompt = prompt + empty_block
+                return prompt
+                
+        # Assign the patch directly to the instance
+        handler.messages_to_prompt = patched_m2p
+
+    try:
+        # Yield back to the execution block (which calls create_chat_completion)
+        yield
+    finally:
+        # Safely restore everything back to its original state for the next generation
+        if handler_template and isinstance(handler_template, str):
+            handler.template = handler_template
+            
+        if original_m2p:
+            # Deleting the instance attribute cleanly restores the original Class method
+            try:
+                del handler.messages_to_prompt
+            except AttributeError:
+                pass

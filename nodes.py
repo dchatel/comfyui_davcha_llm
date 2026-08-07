@@ -271,7 +271,7 @@ class DavchaPromptEnricher(io.ComfyNode):
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = {x: "" for x in m}
 
-        p = f"""Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables. Minimum length > 0. Result in the same format:\n{keys}"""
+        p = f"""Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables: {keys.keys()}. Minimum length per key > 0. Result in the same JSON format: {keys}"""
         messages = [{"role": "system", "content": system or ""}] if system else []
         
         if images is not None:

@@ -246,7 +246,8 @@ class DavchaPromptEnricher(io.ComfyNode):
             category="davcha/llm",
             inputs=[
                 io.Custom("DavchaLLMModel").Input("llm"),
-                io.String.Input("system", multiline=True, dynamic_prompts=False, default="You will be presented with a prompt, an image, and dictionary keys. Keys are placeholders to be expanded to modify the image.\n\nKeep the SAME KEYS.\nKeep the SAME DICTIONARY STRUCTURE.\nProcess ALL keys.\nNO empty values.\nFit the values nicely in the prompt.\nEnsure all values are coherent with each other.\n\nPair each key with a description expanding the concept given by the key.\nWrite a string,string pair json dictionary.\nOnly output json. No commentary."),
+                io.String.Input("system", multiline=True, dynamic_prompts=False, default="You are a headless REST API server. You receive requests and output strictly valid JSON. You do not have a personality. You do not output markdown formatting. Output a single JSON object starting with {."),
+                io.String.Input("user_instruction", multiline=True, dynamic_prompts=False, default="Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables: {keys}. Ensure the generated values can be replaced in the prompt, ensuring grammatical and semantic correctness. Minimum length per key > 0. Result in the same JSON format: {json_format}"),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=False),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.Int.Input("max_tokens", min=1, default=512),
@@ -264,14 +265,18 @@ class DavchaPromptEnricher(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, llm, system, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, enable_thinking, force_json_output, images=None):
+    def execute(cls, llm, system, user_instruction, prompt, seed, max_tokens, temperature, top_p, top_k, repeat_penalty, enable_thinking, force_json_output, images=None):
         if not re.search(r'\{([^}]+)\}', prompt):
             return io.NodeOutput(prompt)
         
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = {x: "" for x in m}
 
-        p = f"""Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables: {keys.keys()}. Minimum length per key > 0. Result in the same JSON format: {keys}"""
+        p = user_instruction
+        p = p.replace("{keys}", str(list(keys.keys())))
+        p = p.replace("{json_format}", str(keys))
+        p = p.replace("{prompt}", prompt)
+        
         messages = [{"role": "system", "content": system or ""}] if system else []
         
         if images is not None:

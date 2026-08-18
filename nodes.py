@@ -81,8 +81,7 @@ class DavchaLLMLoader(io.ComfyNode):
             if cached_data['is_moe']:
                 inputs.append(io.Int.Input("n_cpu_moe", min=0, max=cached_data['max_n_gpu_layers'], default=0))
                 inputs.append(io.Int.Input("expert_used_count", min=1, max=cached_data['expert_count'], default=cached_data['expert_used_count']))
-                
-            # name = Path(os.path.relpath(file, cls.gguf_folder)).parent.name
+
             name = Path(file).stem
             cls._path_map[name] = file
             option = io.DynamicCombo.Option(name, inputs)
@@ -121,14 +120,6 @@ class DavchaLLMLoader(io.ComfyNode):
         model_file = cls._path_map[model_name]
         mmproj_files = glob(os.path.join(os.path.dirname(model_file), "*mmproj*.gguf"))
         mmproj = mmproj_files[0] if mmproj_files else None
-        # models = sorted(glob(os.path.join(cls.gguf_folder, model_name, "*.gguf")), key=lambda x: "mmproj" in x)
-        # if len(models) == 1:
-        #     model_file = models[0]
-        #     mmproj = None
-        # elif len(models) == 2:
-        #     model_file, mmproj = models
-        # else:
-        #     raise FileExistsError(f"Multiple GGUF files found for model '{model_name}' in {cls.gguf_folder}. Expected 1 or 2 (with mmproj), found {len(models)}.")
         
         if mmproj:
             mmproj = get_chat_handler(model_file, mmproj)
@@ -247,7 +238,7 @@ class DavchaPromptEnricher(io.ComfyNode):
             inputs=[
                 io.Custom("DavchaLLMModel").Input("llm"),
                 io.String.Input("system", multiline=True, dynamic_prompts=False, default="You are a headless REST API server. You receive requests and output strictly valid JSON. You do not have a personality. You do not output markdown formatting. Output a single JSON object starting with {."),
-                io.String.Input("user_instruction", multiline=True, dynamic_prompts=False, default="Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables: {keys}. Ensure the generated values can be replaced in the prompt, ensuring grammatical and semantic correctness. Minimum length per key > 0. Result in the same JSON format: {json_format}"),
+                io.String.Input("user_instruction", multiline=True, dynamic_prompts=False, default="Here is a prompt with some variables:\n{prompt}\n\n---\n\nWrite detailed visual descriptions for the following variables: {keys}. Ensure the generated values can be replaced in the prompt, ensuring grammatical correctness and semantic coherence. Ensure no details from the variables are missing. Minimum length per key > 0. Result in the following JSON format: {json_format}"),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=False),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
                 io.Int.Input("max_tokens", min=1, default=512),
@@ -271,10 +262,18 @@ class DavchaPromptEnricher(io.ComfyNode):
         
         m = re.findall(r'\{([^}]+)\}', prompt)
         keys = {x: "" for x in m}
+        json_format = {
+            "type": "json_object",
+            "schema": {
+                "type": "object",
+                "properties": {key:{"type":"string"} for key in m},
+                "required": m
+            }
+        }
 
         p = user_instruction
         p = p.replace("{keys}", str(list(keys.keys())))
-        p = p.replace("{json_format}", str(keys))
+        p = p.replace("{json_format}", str(json_format))
         p = p.replace("{prompt}", prompt)
         
         messages = [{"role": "system", "content": system or ""}] if system else []
@@ -300,18 +299,6 @@ class DavchaPromptEnricher(io.ComfyNode):
             messages.append(
                 {"role": "user", "content": p}
             )
-
-        if force_json_output:
-            response_format = {
-                "type": "json_object",
-                "schema": {
-                    "type": "object",
-                    "properties": {key:{"type":"string"} for key in m},
-                    "required": m
-                }
-            }
-        else:
-            response_format = None
         
         with disable_thinking_context(llm, enable_thinking):
             result = llm.create_chat_completion(
@@ -322,7 +309,7 @@ class DavchaPromptEnricher(io.ComfyNode):
                 top_p=top_p,
                 top_k=top_k,
                 repeat_penalty=repeat_penalty,
-                response_format=response_format,
+                response_format=json_format if force_json_output else None,
             )
         groups = result['choices'][0]['message']['content']
         print(f'------------------\nLLM Response\n------------------\n\n{groups}\n\n------------------')

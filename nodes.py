@@ -11,7 +11,9 @@ import llama_cpp
 from llama_cpp import Llama
 from comfy_api.latest import io
 from pathlib import Path
+import torch
 import folder_paths
+import comfy.model_management
 
 from .utils import *
 
@@ -21,6 +23,70 @@ KV_CACHE_TYPES = {
     "q8_0": getattr(getattr(llama_cpp, "llama_cpp", llama_cpp), "GGML_TYPE_Q8_0", 8),
     "q4_0": getattr(getattr(llama_cpp, "llama_cpp", llama_cpp), "GGML_TYPE_Q4_0", 2),
 }
+
+class LlamaModel:
+    def __init__(self):
+        self.llm = None
+
+class LlamaPatcher:
+    """Minimal patcher so comfy.model_management can load and unload the llama.cpp model like any other model."""
+    def __init__(self, model_file, mmproj_file, n_gpu_layers, llama_kwargs):
+        # Stable object tracked by LoadedModel; the Llama instance inside is created and freed on demand
+        self.model = LlamaModel()
+        self.parent = None
+        self.model_file = model_file
+        self.mmproj_file = mmproj_file
+        self.llama_kwargs = llama_kwargs
+        self.size = os.path.getsize(model_file) + (os.path.getsize(mmproj_file) if mmproj_file else 0)
+        self.offload_device = torch.device("cpu")
+        self.load_device = self.offload_device if n_gpu_layers == 0 else comfy.model_management.get_torch_device()
+
+    def load(self):
+        comfy.model_management.load_models_gpu([self])
+        return self.model.llm
+
+    def model_size(self):
+        return self.size
+
+    def loaded_size(self):
+        return self.size if self.model.llm is not None else 0
+
+    def current_loaded_device(self):
+        return self.load_device if self.model.llm is not None else self.offload_device
+
+    def model_dtype(self):
+        return None
+
+    def model_patches_to(self, device):
+        pass
+
+    def model_patches_models(self):
+        return []
+
+    def is_dynamic(self):
+        return False
+
+    def is_clone(self, other):
+        return other.model is self.model
+
+    def lowvram_patch_counter(self):
+        return 0
+
+    def partially_load(self, device, extra_memory, force_patch_weights=False):
+        if self.model.llm is not None:
+            return 0
+        chat_handler = get_chat_handler(self.model_file, self.mmproj_file) if self.mmproj_file else None
+        self.model.llm = Llama(model_path=self.model_file, chat_handler=chat_handler, **self.llama_kwargs)
+        return self.size
+
+    def partially_unload(self, device, memory_to_free):
+        return 0
+
+    def detach(self, unpatch_all=True):
+        if unpatch_all and self.model.llm is not None:
+            self.model.llm.close()
+            self.model.llm = None
+        return self.model
 
 class DavchaLLMLoader(io.ComfyNode):
     gguf_folder = os.path.join(folder_paths.models_dir, "LLM", "GGUF")
@@ -120,9 +186,6 @@ class DavchaLLMLoader(io.ComfyNode):
         model_file = cls._path_map[model_name]
         mmproj_files = glob(os.path.join(os.path.dirname(model_file), "*mmproj*.gguf"))
         mmproj = mmproj_files[0] if mmproj_files else None
-        
-        if mmproj:
-            mmproj = get_chat_handler(model_file, mmproj)
 
         kv_type = KV_CACHE_TYPES.get(kv_cache_type, KV_CACHE_TYPES["q8_0"])
         
@@ -138,9 +201,7 @@ class DavchaLLMLoader(io.ComfyNode):
             kv_overrides[override_key] = int(expert_used_count)
             print(f"[DavchaLLM] Overriding MoE Top-K: {override_key} = {expert_used_count}")
 
-        llm = Llama(
-            model_path=model_file,
-            chat_handler=mmproj,
+        llama_kwargs = dict(
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             n_cpu_moe=n_cpu_moe,
@@ -157,8 +218,8 @@ class DavchaLLMLoader(io.ComfyNode):
             logits_all=False,
             verbose=False
         )
-        
-        return io.NodeOutput(llm)
+
+        return io.NodeOutput(LlamaPatcher(model_file, mmproj, n_gpu_layers, llama_kwargs))
 
 class DavchaLLM(io.ComfyNode):
     @classmethod
@@ -210,9 +271,11 @@ class DavchaLLM(io.ComfyNode):
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt}
             ]
-            
+
         response_format = json.loads(response_format) if response_format.strip() != "" else None
-        
+
+        llm = llm.load()
+
         with disable_thinking_context(llm, enable_thinking):
             result = llm.create_chat_completion(
                 seed=seed,
@@ -273,7 +336,7 @@ class DavchaPromptEnricher(io.ComfyNode):
 
         p = user_instruction
         p = p.replace("{keys}", str(list(keys.keys())))
-        p = p.replace("{json_format}", str(json_format))
+        p = p.replace("{json_format}", str(keys))
         p = p.replace("{prompt}", prompt)
         
         messages = [{"role": "system", "content": system or ""}] if system else []
@@ -299,7 +362,8 @@ class DavchaPromptEnricher(io.ComfyNode):
             messages.append(
                 {"role": "user", "content": p}
             )
-        
+
+        llm = llm.load()
         with disable_thinking_context(llm, enable_thinking):
             result = llm.create_chat_completion(
                 seed=seed,
